@@ -1,0 +1,4 @@
+train: detection_data/images/train
+val: detection_data/images/validation
+nc: 1
+names: ["detection"]

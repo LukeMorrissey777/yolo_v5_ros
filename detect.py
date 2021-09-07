@@ -11,6 +11,7 @@ import sys
 import time
 from pathlib import Path
 import numpy as np
+from PIL import Image
 
 import cv2
 import torch
@@ -26,7 +27,12 @@ from utils.general import check_img_size, check_requirements, check_imshow, colo
 from utils.plots import colors, plot_one_box
 from utils.torch_utils import select_device, load_classifier, time_sync
 
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image as SensorMsgImage
+from minau.msg import SonarTargetList, SonarTarget
+from math import pi
+
+def grad_to_rad(grads):
+    return 2 * pi * grads / 400
 
 
 class Detector:
@@ -83,11 +89,11 @@ class Detector:
         # Load model
         w = weights[0] if isinstance(weights, list) else weights
         classify, pt, onnx = False, w.endswith('.pt'), w.endswith('.onnx')  # inference type
-        stride, names = 64, [f'class{i}' for i in range(1000)]  # assign defaults
+        stride, self.names = 64, [f'class{i}' for i in range(1000)]  # assign defaults
         if pt:
             self.model = attempt_load(weights, map_location=self.device)  # load FP32 model
             stride = int(self.model.stride.max())  # model stride
-            names = self.model.module.names if hasattr(self.model, 'module') else self.model.names  # get class names
+            self.names = self.model.module.names if hasattr(self.model, 'module') else self.model.names  # get class names
             if half:
                 self.model.half()  # to FP16
             if classify:  # second-stage classifier
@@ -98,8 +104,16 @@ class Detector:
             import onnxruntime
             session = onnxruntime.InferenceSession(w, None)
         imgsz = check_img_size(imgsz, s=stride)  # check image size
+        self.num_grads = 40
 
-        rospy.Subscriber("ping360_node/sonar/cropped_image", Image, self.image_callback)
+        self.range = 10.0
+        self.detection_pub = rospy.Publisher("sonar_processing/target_list",SonarTargetList,queue_size=10)
+        rospy.Subscriber("ping360_node/sonar/cropped_image", SensorMsgImage, self.image_callback)
+
+    def data_callback(self,msg):
+		# Listen to one message to get range then unregister subscriber
+        self.range = float(msg.range)
+        self.data_sub.unregister() 
 
     def format_img(self,img):
         if img.shape[0] > img.shape[1]:
@@ -130,70 +144,77 @@ class Detector:
     def image_callback(self, msg):
         print("Recieved Image")
         np_img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+        im = Image.fromarray(np_img)
+        im.save("temp.png")
+        stride = int(self.model.stride.max())
+        dataset = LoadImages("temp.png", img_size=self.imgsz, stride=stride)
+        for path, img, im0s, vid_cap in dataset:
+            im0 = im0s.copy()
+
         # cv2.imshow("image", np_img)
         # cv2.waitKey()
-        np_img = self.format_img(np_img)
-        img = torch.from_numpy(np.array(np_img)).to(self.device)
-        img = img.float()  # uint8 to fp16/32
-        img /= 255.0  # 0 - 255 to 0.0 - 1.0
-        if len(img.shape) == 3:
-            img = img[None]  # expand for batch dim
-        # print(img)
-
-        # Inference
-        t1 = time_sync()
         
-        visualize = False
-        pred = self.model(img, augment=self.augment, visualize=self.visualize)[0]
+            img = torch.from_numpy(np.array(img)).to(self.device)
+            img = img.float()  # uint8 to fp16/32
+            img /= 255.0  # 0 - 255 to 0.0 - 1.0
+            if len(img.shape) == 3:
+                img = img[None]  # expand for batch dim
+            # print(img)
 
-        # NMS
-        pred = non_max_suppression(pred, self.conf_thres, self.iou_thres, self.classes, self.agnostic_nms, max_det=self.max_det)
-        t2 = time_sync()
-        print("Pred: ", end=" ")
-        print(pred)
+            # Inference
+            t1 = time_sync()
+            
+            visualize = False
+            pred = self.model(img, augment=self.augment, visualize=self.visualize)[0]
 
-        for i, det in enumerate(pred):
-            print(det)
-        return
-        # Process predictions
-        for i, det in enumerate(pred):  # detections per image
-            if webcam:  # batch_size >= 1
-                p, s, im0, frame = path[i], f'{i}: ', im0s[i].copy(), dataset.count
-            else:
-                p, s, im0, frame = path, '', im0s.copy(), getattr(dataset, 'frame', 0)
+            # NMS
+            pred = non_max_suppression(pred, self.conf_thres, self.iou_thres, self.classes, self.agnostic_nms, max_det=self.max_det)
+            t2 = time_sync()
+            # return
+            # Process predictions
+            for i, det in enumerate(pred):  # detections per image
+                s = ''
+                if len(det):
+                    # Rescale boxes from img_size to im0 size
+                    print("detection: ", end="")
+                    print(det)
+                    det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+                    print("detection: ", end="")
+                    print(det[0])
+                    frame_grad_angle = float(msg.header.frame_id)
 
-            p = Path(p)  # to Path
-            save_path = str(save_dir / p.name)  # img.jpg
-            txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # img.txt
-            s += '%gx%g ' % img.shape[2:]  # print string
-            gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
-            imc = im0.copy() if save_crop else im0  # for save_crop
-            if len(det):
-                # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+                    detection_x = ((det[0][0] + det[0][2])/2.0)
+                    detection_y = ((det[0][1] + det[0][3])/2.0) - 10
 
-                # Print results
-                for c in det[:, -1].unique():
-                    n = (det[:, -1] == c).sum()  # detections per class
-                    s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+                    detection_range = detection_x * self.range / msg.width
 
-                # Write results
-                for *xyxy, conf, cls in reversed(det):
-                    if save_txt:  # Write to file
-                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
-                        with open(txt_path + '.txt', 'a') as f:
-                            f.write(('%g ' * len(line)).rstrip() % line + '\n')
+                    image_angle = detection_y * self.num_grads / msg.height
+                    total_grad_angle = frame_grad_angle + 20 - image_angle
+                    rad_angle = grad_to_rad(total_grad_angle)
 
-                    if save_img or save_crop or view_img:  # Add bbox to image
-                        c = int(cls)  # integer class
-                        label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-                        plot_one_box(xyxy, im0, label=label, color=colors(c, True), line_thickness=line_thickness)
-                        if save_crop:
-                            save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
+                    while rad_angle > np.pi:
+                        rad_angle -= 2*np.pi
 
-            # Print time (inference + NMS)
-            print(f'{s}Done. ({t2 - t1:.3f}s)')
+                    while rad_angle < -np.pi:
+                        rad_angle += 2*np.pi
+
+                    target = SonarTarget("Detection", rad_angle, 0.1, 0, 0.1, detection_range, 0.1, False, 
+                        SonarTarget().TARGET_TYPE_UNKNOWN, SonarTarget().UUV_CLASS_UNKNOWN)
+                    header = msg.header
+                    header.frame_id = "base_link"
+                    stl = SonarTargetList(header, [target])
+                    self.detection_pub.publish(stl)
+
+
+
+                    continue
+                    # Print results
+                    for c in det[:, -1].unique():
+                        n = (det[:, -1] == c).sum()  # detections per class
+                        s += f"{n} {self.names[int(c)]}{'s' * (n > 1)}, "  # add to string
+
+                # Print time (inference + NMS)
+                print(f'{s}Done. ({t2 - t1:.3f}s)')
 
 
 

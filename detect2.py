@@ -98,9 +98,11 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
     t0 = time.time()
     for path, img, im0s, vid_cap in dataset:
         if pt:
+            print(type(im0s))
+            print(im0s.shape)
+            print(device)
             print(type(img))
             print(img.shape)
-            print(device)
             img = torch.from_numpy(img).to(device)
             img = img.half() if half else img.float()  # uint8 to fp16/32
         elif onnx:
@@ -118,10 +120,11 @@ def run(weights='yolov5s.pt',  # model.pt path(s)
         elif onnx:
             pred = torch.tensor(session.run([session.get_outputs()[0].name], {session.get_inputs()[0].name: img}))
 
+        print(pred)
         # NMS
         pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
         t2 = time_sync()
-
+        print(pred)
         # Second-stage classifier (optional)
         if classify:
             pred = apply_classifier(pred, modelc, img, im0s)

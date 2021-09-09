@@ -1,17 +1,12 @@
-#!/usr/bin/env python3
 """Run inference with a YOLOv5 model on images, videos, directories, streams
-
 Usage:
     $ python path/to/detect.py --source path/to/img.jpg --weights yolov5s.pt --img 640
 """
 
-import rospy
 import argparse
 import sys
 import time
 from pathlib import Path
-import numpy as np
-from PIL import Image
 
 import cv2
 import torch
@@ -27,203 +22,9 @@ from utils.general import check_img_size, check_requirements, check_imshow, colo
 from utils.plots import colors, plot_one_box
 from utils.torch_utils import select_device, load_classifier, time_sync
 
-from sensor_msgs.msg import Image as SensorMsgImage
-from minau.msg import SonarTargetList, SonarTarget
-from math import pi
-
-def grad_to_rad(grads):
-    return 2 * pi * grads / 400
-
-
-class Detector:
-    def __init__(self,
-        weights='best.pt',  # model.pt path(s)
-        source='data/images',  # file/dir/URL/glob, 0 for webcam
-        imgsz=640,  # inference size (pixels)
-        conf_thres=0.25,  # confidence threshold
-        iou_thres=0.45,  # NMS IOU threshold
-        max_det=1000,  # maximum detections per image
-        device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
-        view_img=False,  # show results
-        save_txt=False,  # save results to *.txt
-        save_conf=False,  # save confidences in --save-txt labels
-        save_crop=False,  # save cropped prediction boxes
-        nosave=False,  # do not save images/videos
-        classes=None,  # filter by class: --class 0, or --class 0 2 3
-        agnostic_nms=False,  # class-agnostic NMS
-        augment=False,  # augmented inference
-        visualize=False,  # visualize features
-        update=False,  # update all models
-        project='runs/detect',  # save results to project/name
-        name='exp',  # save results to project/name
-        exist_ok=False,  # existing project/name ok, do not increment
-        line_thickness=3,  # bounding box thickness (pixels)
-        hide_labels=False,  # hide labels
-        hide_conf=False,  # hide confidences
-        half=False,  # use FP16 half-precision inference
-    ):
-        self.imgsz = imgsz
-        self.device = device
-        self.max_det = max_det
-        self.agnostic_nms = agnostic_nms
-        self.classes = classes
-        self.iou_thres = iou_thres
-        self.conf_thres = conf_thres
-        self.augment = augment
-        self.visualize = visualize
-
-
-        save_img = not nosave and not source.endswith('.txt')  # save inference images
-        webcam = source.isnumeric() or source.endswith('.txt') or source.lower().startswith(
-            ('rtsp://', 'rtmp://', 'http://', 'https://'))
-
-        # Directories
-        save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
-        (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
-
-        # Initialize
-        set_logging()
-        self.device = select_device(device)
-        # half &= device.type != 'cpu'  # half precision only supported on CUDA
-        half = False
-        # Load model
-        w = weights[0] if isinstance(weights, list) else weights
-        classify, pt, onnx = False, w.endswith('.pt'), w.endswith('.onnx')  # inference type
-        stride, self.names = 64, [f'class{i}' for i in range(1000)]  # assign defaults
-        if pt:
-            self.model = attempt_load(weights, map_location=self.device)  # load FP32 model
-            stride = int(self.model.stride.max())  # model stride
-            self.names = self.model.module.names if hasattr(self.model, 'module') else self.model.names  # get class names
-            if half:
-                self.model.half()  # to FP16
-            if classify:  # second-stage classifier
-                modelc = load_classifier(name='resnet50', n=2)  # initialize
-                modelc.load_state_dict(torch.load('resnet50.pt', map_location=device)['model']).to(device).eval()
-        elif onnx:
-            check_requirements(('onnx', 'onnxruntime'))
-            import onnxruntime
-            session = onnxruntime.InferenceSession(w, None)
-        imgsz = check_img_size(imgsz, s=stride)  # check image size
-        self.num_grads = 40
-
-        self.range = 10.0
-        self.detection_pub = rospy.Publisher("sonar_processing/target_list",SonarTargetList,queue_size=10)
-        rospy.Subscriber("ping360_node/sonar/cropped_image", SensorMsgImage, self.image_callback)
-
-    def data_callback(self,msg):
-		# Listen to one message to get range then unregister subscriber
-        self.range = float(msg.range)
-        self.data_sub.unregister() 
-
-    def format_img(self,img):
-        if img.shape[0] > img.shape[1]:
-            other_dim = int((float(img.shape[1])/img.shape[0])*self.imgsz)
-            new_img = cv2.resize(img,(self.imgsz,other_dim))
-        else:
-            other_dim = int((float(img.shape[0])/img.shape[1])*self.imgsz)
-            new_img = cv2.resize(img, (160, self.imgsz))
-
-        return np.einsum('ijk->kji',new_img)
-        # new_img = np.zeros((3, img.shape[0], img.shape[1]))
-        # print(new_img.shape)
-        # new_img = np.einsum('ijk->kij', img)
-        # return new_img
-        # print(new_img.shape)
-
-
-        # if img.shape[0] > img.shape[1]:
-        #     other_dim = int((float(img.shape[1])/img.shape[0])*self.imgsz)
-        #     print((3, self.imgsz, other_dim))
-        #     return cv2.resize(new_img, (self.imgsz, other_dim))
-
-        # other_dim = int((float(img.shape[0])/img.shape[1])*self.imgsz)
-        # print((3, other_dim, self.imgsz))
-        # return cv2.resize(new_img, (160, self.imgsz))
-
-
-    def image_callback(self, msg):
-        print("Recieved Image")
-        np_img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-        im = Image.fromarray(np_img)
-        im.save("temp.png")
-        stride = int(self.model.stride.max())
-        dataset = LoadImages("temp.png", img_size=self.imgsz, stride=stride)
-        for path, img, im0s, vid_cap in dataset:
-            im0 = im0s.copy()
-
-        # cv2.imshow("image", np_img)
-        # cv2.waitKey()
-        
-            img = torch.from_numpy(np.array(img)).to(self.device)
-            img = img.float()  # uint8 to fp16/32
-            img /= 255.0  # 0 - 255 to 0.0 - 1.0
-            if len(img.shape) == 3:
-                img = img[None]  # expand for batch dim
-            # print(img)
-
-            # Inference
-            t1 = time_sync()
-            
-            visualize = False
-            pred = self.model(img, augment=self.augment, visualize=self.visualize)[0]
-
-            # NMS
-            pred = non_max_suppression(pred, self.conf_thres, self.iou_thres, self.classes, self.agnostic_nms, max_det=self.max_det)
-            t2 = time_sync()
-            # return
-            # Process predictions
-            for i, det in enumerate(pred):  # detections per image
-                s = ''
-                if len(det):
-                    # Rescale boxes from img_size to im0 size
-                    print("detection: ", end="")
-                    print(det)
-                    det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
-                    print("detection: ", end="")
-                    print(det[0])
-                    frame_grad_angle = float(msg.header.frame_id)
-
-                    detection_x = ((det[0][0] + det[0][2])/2.0)
-                    detection_y = ((det[0][1] + det[0][3])/2.0) - 10
-
-                    detection_range = detection_x * self.range / msg.width
-
-                    image_angle = detection_y * self.num_grads / msg.height
-                    total_grad_angle = frame_grad_angle + 20 - image_angle
-                    rad_angle = grad_to_rad(total_grad_angle)
-
-                    while rad_angle > np.pi:
-                        rad_angle -= 2*np.pi
-
-                    while rad_angle < -np.pi:
-                        rad_angle += 2*np.pi
-
-                    target = SonarTarget("Detection", rad_angle, 0.1, 0, 0.1, detection_range, 0.1, False, 
-                        SonarTarget().TARGET_TYPE_UNKNOWN, SonarTarget().UUV_CLASS_UNKNOWN)
-                    header = msg.header
-                    header.frame_id = "base_link"
-                    stl = SonarTargetList(header, [target])
-                    self.detection_pub.publish(stl)
-
-
-
-                    continue
-                    # Print results
-                    for c in det[:, -1].unique():
-                        n = (det[:, -1] == c).sum()  # detections per class
-                        s += f"{n} {self.names[int(c)]}{'s' * (n > 1)}, "  # add to string
-
-                # Print time (inference + NMS)
-                print(f'{s}Done. ({t2 - t1:.3f}s)')
-
-
-
-
-
-
 
 @torch.no_grad()
-def run(weights='best.pt',  # model.pt path(s)
+def run(weights='yolov5s.pt',  # model.pt path(s)
         source='data/images',  # file/dir/URL/glob, 0 for webcam
         imgsz=640,  # inference size (pixels)
         conf_thres=0.25,  # confidence threshold
@@ -297,6 +98,11 @@ def run(weights='best.pt',  # model.pt path(s)
     t0 = time.time()
     for path, img, im0s, vid_cap in dataset:
         if pt:
+            print(type(im0s))
+            print(im0s.shape)
+            print(device)
+            print(type(img))
+            print(img.shape)
             img = torch.from_numpy(img).to(device)
             img = img.half() if half else img.float()  # uint8 to fp16/32
         elif onnx:
@@ -304,6 +110,8 @@ def run(weights='best.pt',  # model.pt path(s)
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
         if len(img.shape) == 3:
             img = img[None]  # expand for batch dim
+        print(type(img))
+        print(img.shape)
         # Inference
         t1 = time_sync()
         if pt:
@@ -312,10 +120,11 @@ def run(weights='best.pt',  # model.pt path(s)
         elif onnx:
             pred = torch.tensor(session.run([session.get_outputs()[0].name], {session.get_inputs()[0].name: img}))
 
+        print(pred)
         # NMS
         pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
         t2 = time_sync()
-
+        print(pred)
         # Second-stage classifier (optional)
         if classify:
             pred = apply_classifier(pred, modelc, img, im0s)
@@ -396,7 +205,7 @@ def run(weights='best.pt',  # model.pt path(s)
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default='best.pt', help='model.pt path(s)')
+    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
     parser.add_argument('--source', type=str, default='data/images', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
@@ -427,13 +236,9 @@ def parse_opt():
 def main(opt):
     print(colorstr('detect: ') + ', '.join(f'{k}={v}' for k, v in vars(opt).items()))
     check_requirements(exclude=('tensorboard', 'thop'))
-    d = Detector(**vars(opt))
+    run(**vars(opt))
 
 
 if __name__ == "__main__":
-    rospy.init_node("Yolo_Detector")
     opt = parse_opt()
     main(opt)
-
-    while not rospy.is_shutdown():
-        rospy.spin()

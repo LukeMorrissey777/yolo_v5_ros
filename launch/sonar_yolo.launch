@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<launch>
+
+  <node pkg="yolo_v5_ros" type="sonar_yolo.py" name="sonar_yolo" output="screen">
+		<param name="image_path" value="$(find yolo_v5_ros)"/>
+		<param name="weights" value="$(find yolo_v5_ros)/weights/best.pt"/>
+		<param name="sonar_topic" value="ping360_node/sonar/cropped_image"/>
+		<param name="num_grads" value="40"/>
+		<param name="iou_thres" value="0.45"/>
+		<param name="conf_thres" value="0.25"/>
+		<param name="sonar_range" value="10.0"/>
+  </node>
+
+  <node pkg="minau_tools" type="sonar_detection.py" name="sonar_detection" output="screen"/>
+
+</launch>
